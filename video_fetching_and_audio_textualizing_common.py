@@ -9,7 +9,10 @@ B站视频 + 语音转写 流水线 公共模块
   转写: 讯飞 ASR 凭证 / 上传 / 轮询 / txt+srt+json 三格式存储
   辅助: 依赖检查 / 文件扫描 / 热词校验 / 路径工具
 
-本模块不包含任何 CLI 交互逻辑或 MCP 协议处理。
+本模块为 CLI 与 MCP 共用的核心逻辑集合，不含命令行参数解析与 MCP 协议收发。
+进度/结果类输出统一写到 sys.stderr（如分P下载结果打印 _print_part_result），不占用 sys.stdout；
+MCP 另在 tools/call 派发处用 redirect_stdout 将业务逻辑对 stdout 的写入临时重定向到黑洞，
+作为兜底防御，确保 JSON-RPC 通道不被任何意外输出污染。
 """
 
 import sys
@@ -25,6 +28,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import unicodedata
 
 # ============================================================
 # 路径常量（基于本脚本所在目录）
@@ -63,6 +67,43 @@ WBI_MIXIN_ENC_TAB = [
 # ============================================================
 # 通用工具函数
 # ============================================================
+
+
+def _disp_width(s) -> int:
+    """按终端显示宽度计算字符串宽度（东亚全角/宽字符按 2 计）。"""
+    w = 0
+    for ch in str(s):
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def _pad(s, width, align="left") -> str:
+    """按显示宽度对齐填充（正确处理中文全角字符）。"""
+    s = str(s)
+    pad = width - _disp_width(s)
+    if pad <= 0:
+        return s
+    if align == "right":
+        return " " * pad + s
+    if align == "center":
+        left = pad // 2
+        return " " * left + s + " " * (pad - left)
+    return s + " " * pad
+
+
+def _truncate_disp(s, max_width) -> str:
+    """按显示宽度截断字符串，超出部分以 '..' 结尾。"""
+    s = str(s)
+    if _disp_width(s) <= max_width:
+        return s
+    out, w = "", 0
+    for ch in s:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > max_width - 2:
+            break
+        out += ch
+        w += cw
+    return out + ".."
 
 
 def _format_bytes(size):
@@ -184,7 +225,7 @@ def _get_ytdlp_cmd():
 
 
 class XFYunConfig:
-    """凭证管理，从环境变量或 xfyun_config.json 读取"""
+    """凭证管理，从环境变量或 config.json 读取"""
     instance = None
 
     def __new__(cls):
@@ -192,7 +233,6 @@ class XFYunConfig:
             cls.instance = super().__new__(cls)
             cls.instance.APP_ID = ""
             cls.instance.SECRET_KEY = ""
-            cls.instance.API_KEY = ""
         return cls.instance
 
     def load(self, config_path: str = None):
@@ -201,14 +241,13 @@ class XFYunConfig:
 
         if not self.APP_ID or not self.SECRET_KEY:
             if config_path is None:
-                config_path = os.path.join(SCRIPT_DIR, "xfyun_config.json")
+                config_path = os.path.join(SCRIPT_DIR, "config.json")
             if os.path.exists(config_path):
                 try:
                     with open(config_path, "r", encoding="utf-8") as f:
                         cfg = json.load(f)
                     self.APP_ID = cfg.get("app_id", self.APP_ID)
                     self.SECRET_KEY = cfg.get("secret_key", self.SECRET_KEY)
-                    self.API_KEY = cfg.get("api_key", "")
                 except Exception:
                     pass
 
@@ -228,7 +267,7 @@ def ensure_xfyun_config():
     if not cfg.is_ready:
         return False, (
             "讯飞凭证未配置，请设置环境变量 XF_APP_ID / XF_SECRET_KEY "
-            "或创建 xfyun_config.json"
+            "或创建 config.json"
         )
     return True, ""
 
@@ -369,7 +408,7 @@ class XFYunASR:
         if not self.app_id or not self.secret_key:
             raise ValueError(
                 "缺少讯飞凭证！请设置环境变量 XF_APP_ID / XF_SECRET_KEY "
-                "或创建 xfyun_config.json"
+                "或创建 config.json"
             )
 
     def sign(self) -> tuple:
@@ -537,7 +576,7 @@ class XFYunASR:
 # ============================================================
 
 
-def _validate_hotwords(raw_words: list):
+def validate_hotwords(raw_words: list):
     """校验热词列表：每个词 2-16 字符，最多 200 个。
     返回 (valid, invalid) 两个列表。"""
     if not raw_words:
@@ -550,13 +589,15 @@ def _validate_hotwords(raw_words: list):
 
 
 def parse_hotwords_string(hot_raw: str):
-    """统一热词解析：逗号/分号（中英文均可）、顿号、空白（空格、制表符等）分隔 → 清洗 → 校验。
+    """统一热词解析：仅以空白（空格、制表符等）分隔 → 清洗 → 校验。
+    逗号/分号（中英文均可）、顿号等标点一律视为热词的一部分，不作为分隔符。
+    长度限 2~16 字符、最多 200 个（由 validate_hotwords 保证）。
     返回 (valid, invalid) 两个列表。
     CLI 和 MCP 共用此函数，避免各自实现分隔、校验逻辑。"""
     if not hot_raw or not hot_raw.strip():
         return [], []
-    all_words = [w.strip() for w in re.split(r'[,，;；、\s]+', hot_raw) if w.strip()]
-    return _validate_hotwords(all_words)
+    all_words = [w.strip() for w in hot_raw.split() if w.strip()]
+    return validate_hotwords(all_words)
 
 # ============================================================
 # 文件扫描工具
@@ -607,6 +648,10 @@ def _probe_media(file_path: str, want_height: bool = True):
     return duration, height
 
 
+# ffprobe 探测提示：必须在探测进行「前」给出，避免探测完成后才提示“稍慢”（逻辑倒置）
+PROBE_HINT = "含 ffprobe 探测时长/画质，文件较多时可能稍慢，请稍候…"
+
+
 def format_file_list(folder: str, probe: bool = False) -> list:
     """扫描文件夹，返回音视频文件列表（按修改时间倒序）。
 
@@ -650,6 +695,20 @@ def format_file_list(folder: str, probe: bool = False) -> list:
             files.append(item)
     files.sort(key=lambda x: x["mtime"], reverse=True)
     return files
+
+
+def is_transcribed(name, output_dir=DEFAULT_OUTPUT_DIR) -> bool:
+    """判断某视频是否已转写：要求纯文本 / 字幕 / 分段 JSON 三份产物全部存在。
+
+    参数 name 可为文件名或完整路径，内部取 basename 并去掉扩展名得到 stem。
+    产物文件名沿用 _save_transcript：<stem>_text.txt / <stem>.srt / <stem>_segments.json。
+    """
+    stem = os.path.splitext(os.path.basename(name))[0]
+    return (
+        os.path.exists(os.path.join(output_dir, f"{stem}_text.txt"))
+        and os.path.exists(os.path.join(output_dir, f"{stem}.srt"))
+        and os.path.exists(os.path.join(output_dir, f"{stem}_segments.json"))
+    )
 
 
 def parse_selection(sel: str, max_idx: int, page_start: int = 1) -> list:
@@ -707,7 +766,7 @@ def _save_transcript(video_name: str, result: dict, output_dir: str) -> dict:
         f.write(f"# {video_name}\n")
         f.write(f"# 转写时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# 时长: {result.get('duration', '?')}秒\n")
-        f.write(f"# 语速: ~{len(result.get('plain_text','')) / max(result.get('duration',1),1):.0f}字/秒\n")
+        f.write(f"# 语速: ~{len(result.get('plain_text', '')) / max(result.get('duration', 1), 1):.0f}字/秒\n")
         f.write("\n" + "=" * 40 + "\n\n")
         f.write(result.get("plain_text", ""))
     saved["text_path"] = txt_path
@@ -736,10 +795,12 @@ def _save_transcript(video_name: str, result: dict, output_dir: str) -> dict:
 # B站 视频搜索
 # ============================================================
 # 注意：因本机 Python OpenSSL 与 B站 CDN 的 TLS 握手超时，
-# 所有 B站 API 请求改用 curl.exe（Windows Schannel）通过 subprocess 执行。
+# 搜索/分P 等 B站 Web API 请求改用 curl.exe（Windows Schannel）通过 subprocess 执行；
+# 视频下载与画质探测仍由 yt-dlp 完成（不走 curl）。
+
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 # curl cookie jar 路径（持久化，跨调用复用 cookie）
 CURL_COOKIE_JAR = os.path.join(SCRIPT_DIR, ".bilibili_cookies.txt")
@@ -778,6 +839,7 @@ def _curl_get_json(url, headers=None, timeout=15, include_cookies=True):
         return json.loads(text), None
     except json.JSONDecodeError as e:
         return None, f"JSON 解析失败: {e}"
+
 
 # WBI state: mixin key 缓存
 wbi_state = {"mixin": None, "ts": 0}
@@ -955,6 +1017,121 @@ def search_bilibili(keyword, page=1, page_size=10):
     if data.get("success"):
         return data
     return _search_all_v2(keyword, page, page_size)
+
+
+def format_search_results(data: dict, show_details: bool = False, page_size: int = 10) -> str:
+    """将搜索结果统一格式化为可读字符串（CLI / MCP 共用，避免双份排版逻辑）。
+
+    show_details=True（MCP）时额外输出每条视频的「简介 / 标签」两行，便于 agent
+    获取语义线索；False（CLI）时仅展示核心字段，保持终端紧凑。
+    其余样式（半角冒号、单空格字段分隔、页眉文案、分隔线）已全部统一，不再区分。
+
+    失败 / 无结果 / 正常 三种情形均在此一处处理，CLI 与 MCP 共用同一套输出。
+    """
+    if not data.get("success"):
+        return f"搜索失败: {data.get('error', '未知错误')}"
+
+    keyword = data.get("keyword", "")
+    page = data.get("page", 1)
+    total = data.get("total", 0)
+    page_count = data.get("page_count", 1)
+    videos = data.get("videos", [])
+
+    header = f"关键词: {keyword} | 第 {page}/{page_count} 页 | 共 {total} 个视频"
+    sep = "─" * 60
+    if not videos:
+        return f"{header}\n{sep}\n未找到相关视频"
+
+    # 按本页最大序号对齐：最大数字 ] 后留 1 空格，其余补到同一列，保证整齐
+    max_i = (page - 1) * page_size + len(videos)
+    align = len(f"[{max_i}]") + 1
+
+    lines = [header, sep]
+    for i, v in enumerate(videos, (page - 1) * page_size + 1):
+        title = v.get("title", "（无标题）")
+        author = v.get("author", "-")
+        typename = v.get("typename", "")
+        pubdate = v.get("pubdate", "-")
+        duration = v.get("duration", "-")
+        play = v.get("play", "-")
+        like = v.get("like", "-")
+        favorites = v.get("favorites", "-")
+        video_review = v.get("video_review", "-")
+        bvid = v.get("bvid", "")
+        url = v.get("url") or f"https://www.bilibili.com/video/{bvid}"
+        indent = " " * align
+        pad = " " * (align - len(f"[{i}]"))
+        meta = f"{indent}UP: {author}"
+        if typename:
+            meta += f" | 分区: {typename}"
+        meta += f" | 日期: {pubdate} | 时长: {duration}"
+        block = (
+            f"[{i}]{pad}{title}\n"
+            f"{meta}\n"
+            f"{indent}播放 {play} | 点赞 {like} | 收藏 {favorites} | 弹幕 {video_review}\n"
+            f"{indent}URL: {url}\n"
+        )
+        if show_details:
+            desc = v.get("description", "")
+            tag = v.get("tag", "")
+            if desc:
+                block += f"{indent}简介: {desc}\n"
+            if tag:
+                block += f"{indent}标签: {tag}\n"
+        lines.append(block.rstrip("\n"))
+    return "\n".join(lines)
+
+
+def format_file_table(files: list, folder: str = None, indices=None, probe: bool = False) -> str:
+    """把 format_file_list 返回的文件列表渲染为对齐表格（CLI / MCP 共用，避免双份拼表逻辑）。
+
+    files: format_file_list 的返回（含 name/type_str/size_str/duration_str/quality_str/mtime_str/is_audio）。
+    folder / probe: 仅用于表外摘要与脚注，不影响表格本身。
+    indices: 需高亮的序号集合（如 CLI 选择预览），命中行追加 ' <--'。
+    渲染样式（固定列宽 + '|' 分隔 + '='/'-' 边框）已统一，CLI 与 MCP 输出逐字相同。
+    """
+    n_video = sum(1 for f in files if not f.get("is_audio"))
+    n_audio = len(files) - n_video
+
+    cols = [
+        ("序号", 8, "center"),
+        ("文件名", 40, "left"),
+        ("类型", 11, "left"),
+        ("大小", 11, "right"),
+        ("时长", 9, "right"),
+        ("画质", 7, "center"),
+        ("是否已转写", 10, "center"),
+        ("修改日期", 16, "left"),
+    ]
+    header = " | ".join(_pad(name, w, "center") for name, w, _a in cols)
+    line_w = _disp_width(header)
+    lines = ["=" * line_w, header, "-" * line_w]
+    for i, f in enumerate(files, 1):
+        mark = " <--" if indices and i in indices else ""
+        transcribed = "是" if is_transcribed(f["name"]) else "否"
+        row = [
+            _pad(f"[{i}]", cols[0][1], cols[0][2]),
+            _pad(_truncate_disp(f["name"], cols[1][1]), cols[1][1], cols[1][2]),
+            _pad(f.get("type_str", "-"), cols[2][1], cols[2][2]),
+            _pad(f["size_str"], cols[3][1], cols[3][2]),
+            _pad(f.get("duration_str", "-"), cols[4][1], cols[4][2]),
+            _pad(f.get("quality_str", "-"), cols[5][1], cols[5][2]),
+            _pad(transcribed, cols[6][1], cols[6][2]),
+            _pad(f.get("mtime_str", ""), cols[7][1], cols[7][2]),
+        ]
+        lines.append(" | ".join(row) + mark)
+    lines.append("=" * line_w)
+
+    summary = f"共 {len(files)} 个文件（{n_video} 视频 / {n_audio} 音频"
+    if folder:
+        summary += f"，文件夹: {folder}"
+    summary += "）"
+    note = "（仅扫描根目录，不读取子目录"
+    if probe:
+        note += "；时长/画质经 ffprobe 探测"
+    note += "；“已转写” 依据转写产物目录是否存在同名文件判定；列表已按修改日期降序排列）"
+    return f"{summary}:\n" + "\n".join(lines) + "\n" + note
+
 
 # ============================================================
 # yt-dlp 视频下载
@@ -1174,15 +1351,125 @@ def _check_quality(video_file, quality):
     return actual_quality, quality_warning
 
 
+def max_available_height(bvid_or_url):
+    """下载前探测视频源能提供的最高视频分辨率高度（像素）。
+
+    通过 yt-dlp 仅拉取元数据（-J，不下载）获取所有格式的 height 并取最大值。
+    网络失败 / 解析失败 / 无视频格式时返回 None。"""
+    bvid, base = _parse_bvid_or_url(bvid_or_url)
+    if not bvid:
+        return None
+    ytdlp = _get_ytdlp_cmd()
+    cmd = [*ytdlp, "-J", "--no-playlist", "--no-warnings", base]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except Exception:
+        return None
+    heights = [f.get("height") for f in data.get("formats", []) if f.get("height")]
+    return max(heights) if heights else None
+
+
+def check_quality_available(bvid_or_url, quality):
+    """下载前判断目标画质是否可取（供「不降级下载」模式预跳过用）。
+
+    返回:
+      True  -> 目标画质可满足（quality=best 或 源最高高度 >= 请求高度）
+      False -> 源最高高度 < 请求高度，目标画质确实不可用
+      None  -> 无法判定（探测失败），交由下载流程自行处理
+    """
+    if quality == "best" or quality not in QUALITY_HEIGHT:
+        return True
+    req_h = QUALITY_HEIGHT[quality]
+    max_h = max_available_height(bvid_or_url)
+    if max_h is None:
+        return None
+    return max_h >= req_h
+
+
+def preflight_quality_ok(item, quality, allow_fb):
+    """下载前画质预检（不降级下载模式），返回 (ok, reason)。
+
+    - ok=True   允许继续下载；
+    - ok=False  目标画质源端不可用且不允许降级，应直接跳过（不下载），reason 为说明文本。
+    quality='best' 或 允许降级时恒为 True；预检探测失败时返回 True，交由下载后兜底处理。
+    """
+    if quality == "best" or allow_fb:
+        return True, None
+    try:
+        avail = check_quality_available(item, quality)
+    except Exception:
+        return True, None
+    if avail is False:
+        return False, f"目标画质 {quality} 源端不可用，已设置不降级下载，跳过该视频（未下载）"
+    return True, None
+
+
+def post_download_quality_check(result, allow_fb):
+    """下载后画质降级兜底（不降级下载模式）。
+
+    若实际画质低于目标且不允许降级，删除已下载的视频/音频文件并标记放弃。
+    返回 (result, deleted, note)：deleted=True 时 result 已被改写（success=False, status=abandoned_quality_fallback）。
+    """
+    qw = result.get("quality_warning")
+    if not qw or allow_fb:
+        return result, False, None
+    files = result.get("files") or ([result.get("file")] if result.get("file") else [])
+    audios = result.get("audio_files") or ([result.get("audio_file")] if result.get("audio_file") else [])
+    for f in files:
+        if f and os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    for a in audios:
+        if a and os.path.exists(a):
+            try:
+                os.remove(a)
+            except OSError:
+                pass
+    new_result = dict(result)
+    new_result["success"] = False
+    new_result["status"] = "abandoned_quality_fallback"
+    new_result["reason"] = "目标画质不可用，已设置不降级下载，放弃并删除已下载文件"
+    note = f"[!] {qw}（文件已删除，已放弃该视频）"
+    return new_result, True, note
+
+
+# 分P探测缓存：同一个 bvid/url 在一次进程生命周期内只探测一次
+_parts_cache = {}
+
+
+def detect_parts_cached(bvid_or_url):
+    """带缓存的分P探测，避免批量下载时对同一视频重复请求网络。"""
+    key = str(bvid_or_url)
+    if key in _parts_cache:
+        return _parts_cache[key]
+    try:
+        _parts_cache[key] = detect_parts(bvid_or_url)
+    except Exception:
+        _parts_cache[key] = {"success": False, "error": "detect_parts 异常"}
+    return _parts_cache[key]
+
+
 def _print_part_result(part_no, vf, af, q, qw):
-    """多分P下载时，单个分P完成后打印其结果（实际画质/本地视频/本地音频）。"""
+    """多分P下载时，单个分P完成后打印其结果（实际画质/本地视频/本地音频）。
+
+    输出定向到 sys.stderr，避免污染 sys.stdout；在 MCP（stdio）场景下
+    stdout 是 JSON-RPC 通道，任何 stdout 文本都会破坏协议，故进度/日志类
+    输出统一走 stderr（与 echo 进度输出一致）。"""
     if not vf:
-        print(f"  [!] 分P[{part_no}] 下载失败（未生成视频文件）")
+        print(f"  [!] 分P[{part_no}] 下载失败（未生成视频文件）", file=sys.stderr)
         return
-    print(f"  分P[{part_no}] 下载完成！")
-    print(f"  - 实际画质: {q}" + (f"  [!] {qw}" if qw else ""))
-    print(f"  - 本地视频: {vf}")
-    print(f"  - 本地音频: {af or '提取失败（视频已保存）'}")
+    print(f"  分P[{part_no}] 下载完成！", file=sys.stderr)
+    print(f"  - 实际画质: {q}" + (f"  [!] {qw}" if qw else ""), file=sys.stderr)
+    print(f"  - 本地视频: {vf}", file=sys.stderr)
+    print(f"  - 本地音频: {af or '提取失败（视频已保存）'}", file=sys.stderr)
 
 
 def _download_one(url, out_dir, bvid, quality, template_suffix=None, echo=False, part_no=None):
@@ -1212,7 +1499,7 @@ def _download_one(url, out_dir, bvid, quality, template_suffix=None, echo=False,
         # （多P 视频各分P 文件名共享同一 BV 号，旧逻辑总会命中字母序首个 p01）
         _before = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.PIPE, bufsize=0)
+                                stdin=subprocess.PIPE, bufsize=0)
         output_lines = _stream_output(proc, echo=echo)
         try:
             proc.wait(timeout=3600)
@@ -1242,7 +1529,7 @@ def _download_one(url, out_dir, bvid, quality, template_suffix=None, echo=False,
         # 也可能发生在其后 _extract_audio(vf)（ffmpeg 提取音频）阶段——两者都在此 try 内。
         # KeyboardInterrupt 是 BaseException 子类，不会被下方 except Exception 捕获，
         # 这里先杀掉可能残留的 yt-dlp 子进程，再原样抛出，
-        # 由上层 CLI（download_video 调用处的 except KeyboardInterrupt）转成 QuitProgram 优雅退出。
+        # 由上层调用方处理（CLI 侧会捕获并转成 QuitProgram 优雅退出）。
         if proc is not None and proc.poll() is None:
             try:
                 proc.kill()
@@ -1258,7 +1545,7 @@ def _download_one(url, out_dir, bvid, quality, template_suffix=None, echo=False,
 def download_video(bvid_or_url, download_dir=None, quality="best", part=None, all_parts=False, echo=False):
     """使用 yt-dlp 下载 B站视频，自动提取音频。
     part: 指定分P序号（1-based）；all_parts: 下载全部分P（逐个下载，每P下完立即提取音频）。默认只下第1P。
-    echo: 为 True 时实时输出 yt-dlp 下载进度到 stderr（适合 CLI 模式）。"""
+    echo: 为 True 时实时输出 yt-dlp 下载进度到 stderr。"""
     bvid, base = _parse_bvid_or_url(bvid_or_url)
     if not bvid:
         return {"success": False, "error": "无效的视频标识，请提供 BV 号或 B站视频链接"}
@@ -1487,7 +1774,7 @@ def check_dependencies():
     else:
         results["xfyun-asr"] = {
             "available": False,
-            "error": "未配置，请设置环境变量 XF_APP_ID / XF_SECRET_KEY 或创建 xfyun_config.json",
+            "error": "未配置，请设置环境变量 XF_APP_ID / XF_SECRET_KEY 或创建 config.json",
         }
 
     all_ok = (
@@ -1515,14 +1802,18 @@ def format_deps_text(data):
                 out.append(f"    [X]  {name}{pad}")
         return out
 
-    lines = ["[DEPS] 依赖检查结果", "=" * 60]
+    lines = ["[依赖清单]"]
     lines += _render_group("必要依赖", ("yt-dlp", "ffmpeg", "ffprobe"))
     lines += _render_group("非必要依赖", ("xfyun-asr",))
-    lines.append("-" * 60)
+
+    lines.append("")
+    lines.append("[依赖检查结果]")
     if not data.get("all_ready"):
-        lines.append("[WARN] 缺少必要依赖，请先按 README.md 安装所有必要依赖并配置环境变量后再运行")
+        lines.append("  缺少必要依赖，请先按 README.md 安装所有必要依赖并配置环境变量后再运行")
     elif not deps.get("xfyun-asr", {}).get("available", False):
-        lines.append("[WARN] 讯飞凭证未配置，转写功能暂不可用，仅搜索/下载可用")
+        lines.append("  讯飞凭证未配置，转写功能暂不可用，仅搜索/下载可用")
+    else:
+        lines.append("  所有必要依赖及讯飞凭证均已就绪，可完整使用所有功能")
     return "\n".join(lines)
 
 # ============================================================
@@ -1599,7 +1890,8 @@ def _run_batch(items, work, concurrency=1, sort_key=None):
         for f in as_completed(ex.submit(work, it) for it in items):
             results.append(f.result())
     if sort_key is None:
-        sort_key = lambda r: items.index(r.get("input"))
+        def sort_key(r):
+            return items.index(r.get("input"))
     results.sort(key=sort_key)
     ok = sum(1 for r in results if r.get("success"))
     return results, ok, len(results)
