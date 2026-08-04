@@ -1,0 +1,15 @@
+# 米游社攻略文章链接列表
+# 每行一个 URL，空行和以 # 开头的行会被忽略
+# 程序会自动从 URL 中提取 post_id 与 game_id
+
+https://www.miyoushe.com/ys/article/74664757
+https://www.miyoushe.com/ys/article/73110307
+https://www.miyoushe.com/ys/article/75454926
+https://www.miyoushe.com/ys/article/72356157
+https://www.miyoushe.com/ys/article/72333712
+https://www.miyoushe.com/ys/article/72722041
+https://www.miyoushe.com/ys/article/72446678
+https://www.miyoushe.com/ys/article/72536516
+https://www.miyoushe.com/ys/article/72382183
+https://www.miyoushe.com/ys/article/72701585
+https://www.miyoushe.com/ys/article/72184027

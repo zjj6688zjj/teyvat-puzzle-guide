@@ -1,0 +1,47 @@
+
+   在 单个/main.py 中写了一个完整的米游社文章爬虫，并验证可以正常运行。
+
+   实现思路
+
+   米游社文章页是 Nuxt.js 单页应用，直接请求 HTML 拿不到正文内容，所以代码改走官方 API：
+
+   ```text
+     https://bbs-api.miyoushe.com/post/wapi/getPostFull?gids=2&post_id=76857165
+   ```
+
+   从 API 返回的 JSON 中分别提取：
+
+   • 文本：subject（标题）+ content（HTML 正文），用 BeautifulSoup 去标签得到纯文本
+   • 图片：images 数组，同时兜底扫描 content 里的 <img> 标签
+   • 视频：
+     - 米游社原生视频在 API 外层 post 的 vod_list.resolutions 中（取最高清晰度下载）
+     - 兜底扫描 content 里的 <video> / <source> 标签
+     - 嵌入式视频（如 Bilibili iframe）保存为 embed_xxx.html 引用
+
+   输出目录结构
+
+   每个攻略会按文章 ID 分别保存，避免多次爬取互相覆盖。进入 单个/ 目录运行 python main.py 后会生成：
+
+   ```text
+     单个/output/
+     └── 76382075/                     # 文章 ID，每个攻略独立一个文件夹
+         ├── text/
+         │   ├── article.txt           # 纯文本阅读版
+         │   └── article.json          # 完整元数据 + 原文 HTML + 纯文本
+         ├── images/
+         │   ├── img_001.jpg
+         │   ├── img_002.png
+         │   └── images.json           # 图片 URL 与本地文件对应清单
+         └── videos/
+             └── videos.json           # 视频清单（本篇文章没有视频）
+   ```
+
+   依赖
+
+   代码只用到了 requests 和 beautifulsoup4，当前环境已安装。如果后续换环境运行，安装即可：
+
+   ```bash
+     pip install requests beautifulsoup4
+   ```
+
+   如需爬取其他米游社文章，修改文件顶部的 ARTICLE_URL 或 POST_ID 即可。每次更换 POST_ID 后，新的攻略会保存到 单个/output/{post_id}/ 下，旧的攻略文件仍然保留。
