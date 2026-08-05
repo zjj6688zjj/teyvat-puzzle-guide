@@ -1,0 +1,8 @@
+faiss-cpu>=1.7
+numpy
+openai>=1.0
+fastapi
+uvicorn
+streamlit
+python-dotenv
+pyyaml

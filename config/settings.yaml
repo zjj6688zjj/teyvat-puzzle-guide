@@ -1,0 +1,32 @@
+# ===== 全部可调参数集中管理 =====
+
+llm:
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  model: deepseek-v4-flash      # 有问题可切回 deepseek-chat
+  temperature: 0.3
+  max_tokens: 2500              # 推理+回答都要占 token，调大防止回答被截断
+  reasoning_effort: low         # low=快速回答（快3~8倍）；需要深度推理时可改 high
+
+embedding:
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASH_SCOPE_API_KEY
+  model: qwen3.7-text-embedding
+  dimensions: 1024
+  batch_size: 16               # 每批向量化条数
+
+retrieval:
+  top_k: 5                     # 召回条数（评测后可调 3/8/10）
+
+chunking:
+  chunk_size_tokens: 512       # 分段大小（评测后可调 256/1024）
+  overlap_tokens: 50           # 分段重叠（评测后可调 25/100）
+  token_per_chinese_char: 0.6  # 1 token ≈ 0.6 个汉字
+
+paths:
+  raw_output: ../output                 # 米游社爬虫产物（主数据源）：../output/{post_id}/text/article.json
+  raw_video: data/raw/video_transcripts
+  raw_text: data/raw/text_guides
+  processed: data/processed/knowledge.jsonl
+  vector_index: data/vector_index
+  eval_dir: data/eval

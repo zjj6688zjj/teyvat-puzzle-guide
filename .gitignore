@@ -1,0 +1,21 @@
+# 密钥
+config/.env
+.env
+
+# 数据（原始采集物与本地索引不入库）
+# data/raw 只保留空目录结构（.gitkeep），攻略文件不入库
+data/raw/*
+!data/raw/
+!data/raw/**/
+!data/raw/.gitkeep
+!data/raw/**/.gitkeep
+data/vector_index/
+data/processed/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 其他
+.DS_Store
